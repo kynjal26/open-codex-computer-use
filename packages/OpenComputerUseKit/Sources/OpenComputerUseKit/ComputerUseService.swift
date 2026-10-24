@@ -695,6 +695,8 @@ public final class ComputerUseService {
             do {
                 switch clickMethod {
                 case .auto:
+                    let wasUnselectedWebTab = button == .left && clickCount == 1
+                        && webSelectionState(of: record) == false
                     if !(try performAXClickSequence(
                         on: record,
                         snapshot: snapshot,
@@ -705,6 +707,22 @@ public final class ComputerUseService {
                     )) {
                         try performNonAXClickFallback(
                             at: targetPoint,
+                            button: button,
+                            clickCount: clickCount,
+                            targetDescription: "element_index=\(elementIndex)",
+                            snapshot: snapshot
+                        )
+                    }
+                    if wasUnselectedWebTab, !webTabBecameSelected(record),
+                       snapshot.windowBounds != nil, snapshot.targetWindowID != nil
+                    {
+                        // Some web tabs (e.g. Search Console's Material tabs) ignore both AXPress
+                        // and process-posted clicks; a window-targeted sky_click selects them.
+                        debugClickDecision("web tab still unselected; retrying with sky_click")
+                        try performExplicitMouseClick(
+                            method: .skyClick,
+                            at: targetPoint,
+                            windowPoint: windowPoint,
                             button: button,
                             clickCount: clickCount,
                             targetDescription: "element_index=\(elementIndex)",
@@ -1550,6 +1568,38 @@ public final class ComputerUseService {
         )
     }
 
+    /// Selection state of a tab or radio button inside web content; nil for anything else.
+    private func webSelectionState(of record: ElementRecord) -> Bool? {
+        guard let element = record.element,
+              let role = stringValue(of: element, attribute: kAXRoleAttribute as String),
+              [kAXRadioButtonRole as String, "AXTab"].contains(role),
+              hasAncestorRole("AXWebArea", of: element)
+        else {
+            return nil
+        }
+        var value: CFTypeRef?
+        for attribute in [kAXSelectedAttribute as String, kAXValueAttribute as String] {
+            if AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+               let number = value as? NSNumber
+            {
+                return number.boolValue
+            }
+        }
+        return nil
+    }
+
+    /// Polls briefly, since web content updates selection asynchronously after a press.
+    private func webTabBecameSelected(_ record: ElementRecord) -> Bool {
+        let deadline = Date().addingTimeInterval(0.4)
+        repeat {
+            if webSelectionState(of: record) == true {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        return false
+    }
+
     private func bestElement(containing point: CGPoint, in snapshot: AppSnapshot) -> ElementRecord? {
         snapshot.elements.values
             .filter { $0.localFrame?.contains(point) ?? false }
@@ -1565,9 +1615,10 @@ public final class ComputerUseService {
             .first
     }
 
+    /// `point` is window-local, like `ElementRecord.localFrame` (both callers pass such points).
     private func hitTestElement(at point: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
-        let globalPoint = try screenshotToGlobalPoint(snapshot: snapshot, x: Double(point.x), y: Double(point.y))
+        let globalPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
         var hitElement: AXUIElement?
         let result = AXUIElementCopyElementAtPosition(appElement, Float(globalPoint.x), Float(globalPoint.y), &hitElement)
         guard result == .success, let hitElement else {
